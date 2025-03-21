@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, ContextManager
 from contextlib import contextmanager
+from .proxy import Proxy
 
 class ProxyManager:
     """
@@ -46,30 +47,59 @@ class ProxyManager:
             conn.close()
 
     def _setup_database(self):
-        """Инициализация базы данных (внутренний метод)"""
+        """Создает базу данных и необходимые таблицы."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS proxies (
-                    ip TEXT,
-                    port INTEGER,
-                    protocol TEXT,
-                    country TEXT,
-                    anonymity TEXT,
-                    collection_date TEXT,
-                    last_check TEXT,
-                    response_time REAL,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ip TEXT NOT NULL,
+                    port TEXT NOT NULL,
+                    protocol TEXT NOT NULL,
                     status TEXT,
+                    response_time REAL,
+                    last_check TEXT,
+                    collection_date TEXT,
                     is_outdated INTEGER DEFAULT 0,
-                    PRIMARY KEY (ip, port)
+                    UNIQUE(ip, port)
                 )
             """)
-            # Индексы для оптимизации
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_status ON proxies(status)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_outdated ON proxies(is_outdated)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_protocol ON proxies(protocol)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_collection_date ON proxies(collection_date)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_last_check ON proxies(last_check)")
+            
+            # Создаем индексы для ускорения запросов
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_proxies_status 
+                ON proxies(status)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_proxies_is_outdated 
+                ON proxies(is_outdated)
+            """)
+
+    def get_proxy_by_id(self, proxy_id: int):
+        """
+        Получает прокси по его ID.
+        
+        Args:
+            proxy_id: ID прокси
+            
+        Returns:
+            Proxy: Объект прокси или None, если не найден
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT ip, port, protocol, status, response_time 
+                FROM proxies 
+                WHERE id = ?
+            """, (proxy_id,))
+            
+            row = cursor.fetchone()
+            if row:
+                proxy = Proxy(ip=row[0], port=row[1], protocol=row[2])
+                proxy.status = row[3]
+                proxy.response_time = row[4]
+                return proxy
+            return None
 
     def mark_all_outdated(self):
         """Помечает все прокси как устаревшие."""
@@ -141,7 +171,7 @@ class ProxyManager:
                 }
             return None
 
-    def get_working_proxies(self, limit: int = 10, max_age_hours: int = 24) -> List[dict]:
+    def get_working_proxies(self, limit: int = 10, max_age_hours: int = 24) -> List[Proxy]:
         """
         Получить список рабочих прокси не старше указанного возраста.
         
@@ -150,31 +180,28 @@ class ProxyManager:
             max_age_hours: Максимальный возраст прокси в часах
             
         Returns:
-            List[dict]: Список прокси
+            List[Proxy]: Список прокси
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
             min_date = (datetime.now() - timedelta(hours=max_age_hours)).isoformat()
             
             cursor.execute("""
-                SELECT ip, port, protocol, country, response_time, last_check
+                SELECT ip, port, protocol, status, response_time
                 FROM proxies
                 WHERE status = 'working'
                 AND is_outdated = 0
-                AND last_check > ?
                 ORDER BY response_time ASC
                 LIMIT ?
-            """, (min_date, limit))
+            """, (limit,))
             
-            return [{
-                'ip': row[0],
-                'port': row[1],
-                'protocol': row[2],
-                'country': row[3],
-                'response_time': row[4],
-                'last_check': row[5],
-                'url': f"{row[2]}://{row[0]}:{row[1]}"
-            } for row in cursor.fetchall()]
+            proxies = []
+            for row in cursor.fetchall():
+                proxy = Proxy(ip=row[0], port=row[1], protocol=row[2])
+                proxy.status = row[3]
+                proxy.response_time = row[4]
+                proxies.append(proxy)
+            return proxies
 
     def get_random_working_proxy(self, max_age_hours: int = 24) -> Optional[dict]:
         """
@@ -216,27 +243,21 @@ class ProxyManager:
                 "collection_date": collection_date
             }
 
-    def mark_proxy_as_failed(self, proxy_url: str):
+    def mark_proxy_as_failed(self, proxy_id: int):
         """
         Помечает прокси как нерабочий.
         
         Args:
-            proxy_url: URL прокси для маркировки
+            proxy_id: ID прокси для маркировки
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            # Извлекаем IP и порт из URL
-            parts = proxy_url.split('://')[-1].split(':')
-            ip = parts[0]
-            port = parts[1]
-            
             cursor.execute("""
                 UPDATE proxies 
-                SET status = 'failed',
-                    last_check = CURRENT_TIMESTAMP
-                WHERE ip = ? AND port = ?
-            """, (ip, port))
-            conn.commit()
+                SET status = 'failed', 
+                    last_check = ?
+                WHERE id = ?
+            """, (datetime.now().isoformat(), proxy_id))
 
     def get_multiple_working_proxies(self, limit: int = 100, max_age_hours: int = 24) -> List[dict]:
         """
@@ -348,33 +369,49 @@ class ProxyManager:
             
             return stats
 
-    def add_proxy(self, ip: str, port: int, protocol: str = 'http', collection_date: str = None) -> None:
+    def add_proxy(self, proxy):
         """
         Добавляет новый прокси в базу данных.
         
         Args:
-            ip: IP адрес прокси
-            port: Порт прокси
-            protocol: Протокол прокси (http/https)
-            collection_date: Дата сбора прокси
-        """
-        if collection_date is None:
-            collection_date = datetime.now().isoformat()
+            proxy: Объект Proxy для добавления
             
+        Returns:
+            int: ID добавленного прокси
+        """
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO proxies (
-                    ip, port, protocol, collection_date, is_outdated
-                )
-                VALUES (?, ?, ?, ?, 0)
-                ON CONFLICT(ip, port) DO UPDATE SET
-                    protocol = ?,
-                    collection_date = ?,
-                    is_outdated = 0
+                INSERT OR IGNORE INTO proxies (ip, port, protocol, collection_date)
+                VALUES (?, ?, ?, ?)
+            """, (proxy.ip, proxy.port, proxy.protocol, datetime.now().isoformat()))
+            
+            # Если прокси уже существует, получаем его ID
+            if cursor.rowcount == 0:
+                cursor.execute("""
+                    SELECT id FROM proxies WHERE ip = ? AND port = ?
+                """, (proxy.ip, proxy.port))
+                return cursor.fetchone()[0]
+            
+            return cursor.lastrowid
+
+    def update_proxy_status(self, proxy):
+        """
+        Обновляет статус прокси в базе данных.
+        
+        Args:
+            proxy: Объект Proxy для обновления
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE proxies 
+                SET status = ?, response_time = ?, last_check = ?
                 WHERE ip = ? AND port = ?
             """, (
-                ip, port, protocol, collection_date,
-                protocol, collection_date,
-                ip, port
+                proxy.status,
+                proxy.response_time,
+                datetime.now().isoformat(),
+                proxy.ip,
+                proxy.port
             ))
